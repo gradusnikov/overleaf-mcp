@@ -1,0 +1,44 @@
+# Throwaway Overleaf CE 6.3.1 for testing overleaf-mcp locally: docker compose -f test/docker-compose.yml up -d
+name: overleaf-mcp-test
+services:
+  sharelatex:
+    image: sharelatex/sharelatex:6.3.1
+    container_name: olmcp-sharelatex
+    depends_on: [mongo, redis]
+    ports: ["127.0.0.1:18080:80"]
+    environment:
+      OVERLEAF_APP_NAME: overleaf-mcp test
+      OVERLEAF_MONGO_URL: mongodb://mongo/sharelatex
+      OVERLEAF_REDIS_HOST: redis
+      REDIS_HOST: redis
+      OVERLEAF_SITE_URL: http://localhost:18080
+      ENABLED_LINKED_FILE_TYPES: project_file,project_output_file
+      ENABLE_CONVERSIONS: "true"
+      EMAIL_CONFIRMATION_DISABLED: "true"
+      OVERLEAF_INVITE_TOKEN_SECRET: ${OVERLEAF_INVITE_TOKEN_SECRET}  # generated into test/.env
+  mongo:
+    image: mongo:8.0.34
+    container_name: olmcp-mongo
+    command: --replSet overleaf
+    healthcheck:
+      test: echo 'try { rs.status() } catch (e) { rs.initiate({_id:"overleaf",members:[{_id:0,host:"mongo:27017"}]}) }' | mongosh --quiet
+      interval: 5s
+  redis:
+    image: redis:7.4.11
+    container_name: olmcp-redis
+  mcp:
+    image: overleaf-mcp:0.1.0
+    container_name: olmcp-mcp
+    depends_on: [sharelatex]
+    restart: unless-stopped
+    ports: ["127.0.0.1:18444:8443"]
+    environment:
+      OVERLEAF_URL: http://sharelatex
+      OVERLEAF_EMAIL: agent@example.com
+      OVERLEAF_PASSWORD_FILE: /run/secrets/overleaf-password
+      MCP_TOKENS_FILE: /run/secrets/mcp-tokens
+      MCP_BIND: 0.0.0.0:8443
+      MCP_ALLOWED_HOSTS: localhost
+      MCP_TLS_CERT: /run/secrets/tls.crt
+      MCP_TLS_KEY: /run/secrets/tls.key
+    volumes: ["./secrets:/run/secrets:ro"]

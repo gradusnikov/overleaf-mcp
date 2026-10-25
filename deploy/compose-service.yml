@@ -1,0 +1,20 @@
+# Service to add under `services:` in the docker-compose.yml that runs Overleaf (indent it like the other
+# services there). It must share a network with the Overleaf service, here named `sharelatex` as in the
+# Overleaf toolkit; if your services list `networks:`, add the same network to this one. It is published on
+# loopback only, so that the reverse proxy in front of Overleaf terminates HTTPS (see apache-overleaf-mcp.conf).
+    overleaf-mcp:
+        image: overleaf-mcp:0.1.0
+        container_name: overleaf-mcp
+        restart: always
+        depends_on:
+            - sharelatex
+        ports:
+            - 127.0.0.1:5010:8080
+        environment:
+            OVERLEAF_URL: http://sharelatex
+            OVERLEAF_EMAIL: overleaf-agent@example.com
+            OVERLEAF_PASSWORD_FILE: /run/secrets/overleaf-password
+            MCP_TOKENS_FILE: /run/secrets/mcp-tokens
+            MCP_ALLOWED_HOSTS: overleaf.example.com,127.0.0.1:5010
+        volumes:
+            - ./mcp-secrets:/run/secrets:ro

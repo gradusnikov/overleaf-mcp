@@ -1,0 +1,32 @@
+[package]
+name = "overleaf-mcp"
+version = "0.1.0"
+edition = "2024"
+description = "MCP server (streamable HTTP) that lets agents work with an Overleaf Community Edition instance"
+license = "Apache-2.0"
+authors = ["Wojciech Gradkowski"]
+repository = "https://github.com/gradusnikov/overleaf-mcp"
+readme = "README.md"
+keywords = ["mcp", "overleaf", "latex", "sharelatex"]
+
+[dependencies]
+rmcp = { version = "3.7.0", features = ["server", "macros", "schemars", "transport-streamable-http-server"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net"] }
+tokio-util = "0.7"
+axum = "0.8.9"
+axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "cookies", "json", "multipart", "query", "http2", "charset"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+regex = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
