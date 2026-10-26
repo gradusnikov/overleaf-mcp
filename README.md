@@ -17,8 +17,9 @@ This is an independent project, not affiliated with or endorsed by Overleaf.
 |---|---|
 | `list_projects` | projects the user owns or can access (`search`, `include_archived`) |
 | `create_project` | new project with a minimal `main.tex` (or Overleaf's example project) |
-| `list_files` | file tree with types (`doc` = editable text, `file` = binary) and the main document |
+| `list_files` | file tree with types (`doc` = editable text, `file` = binary), the git blob SHA-1 of each `file`, and the main document |
 | `read_file` | text files as text, images as images |
+| `download_project` | the whole project as a zip archive |
 | `write_file` | create or overwrite a file; creates folders; `base64` for binary files |
 | `edit_file` | replace an exact string (once, or `replace_all`) |
 | `delete_file` | delete a file or folder |
@@ -31,6 +32,11 @@ This is an independent project, not affiliated with or endorsed by Overleaf.
 
 Writes go through Overleaf's upload endpoint, which updates an existing document in place (same id, history
 kept); people who have the project open see the change immediately.
+
+File paths are resolved through the project's file tree, which Overleaf only sends when a client joins the
+project over its real-time socket, and it allows 45 joins per user and project per minute. The server therefore
+caches each tree for a minute (fetching it again after its own writes, when a path is missing, or when a read
+fails), `list_files` always fetches a fresh one, and a rate-limited join is retried for up to 90 seconds.
 
 ## Configuration
 
@@ -51,7 +57,7 @@ The MCP endpoint is `/mcp`; every request needs `Authorization: Bearer <token>`.
 
 ```sh
 cargo build --release              # local binary
-docker build -t overleaf-mcp:0.1.0 .   # static musl binary in a FROM scratch image (~10 MB)
+docker build -t overleaf-mcp:0.2.0 .   # static musl binary in a FROM scratch image (~10 MB)
 ```
 
 ## Client setup (Claude Code)

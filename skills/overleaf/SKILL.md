@@ -23,8 +23,10 @@ with it. Load the tool schemas with ToolSearch (`select:mcp__overleaf__list_proj
 
 - `list_files` gives the tree with types: `doc` = editable text with history (.tex, .bib, .cls, .sty, ...),
   `file` = everything else, including text formats Overleaf does not treat as documents (.dot, .puml).
-  It also names the main document.
+  It also names the main document. Files (`file`) carry `hash`, the SHA-1 `git hash-object` gives for their
+  content, so a local copy can skip unchanged ones.
 - `read_file`: text as text, images as images, other binaries as a blob.
+- `download_project`: the whole project as one zip; use it to copy a project rather than reading every file.
 - `edit_file` replaces an exact string; `old_string` must occur exactly once unless `replace_all`. Read the
   file first and copy the text exactly, including whitespace. Prefer it over `write_file` for changes to
   existing files: it keeps the diff small and fails loudly when the text moved.

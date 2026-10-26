@@ -7,8 +7,8 @@ AGENT=overleaf-agent@example.com           # Overleaf account the agents act as
 SITE=https://overleaf.example.com          # public Overleaf URL
 
 # 1. image: build it here, or on another machine and copy it:
-#      docker save overleaf-mcp:0.1.0 | gzip | ssh root@overleaf-host 'gunzip | docker load'
-docker image inspect overleaf-mcp:0.1.0 >/dev/null
+#      docker save overleaf-mcp:0.2.0 | gzip | ssh root@overleaf-host 'gunzip | docker load'
+docker image inspect overleaf-mcp:0.2.0 >/dev/null
 
 # 2. a dedicated Overleaf user; this prints an activation link, open it and set a password
 #    (it must not contain the e-mail's local part, Overleaf rejects that)

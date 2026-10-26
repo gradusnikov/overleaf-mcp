@@ -3,9 +3,11 @@
 //! Overleaf CE has no public API, so this logs in as an ordinary user (session cookie + CSRF
 //! token) and calls the same routes as the frontend. The project file tree, with the entity ids
 //! needed to delete files or pick the root document, is only sent over the real-time socket, so
-//! [`Overleaf::project_tree`] performs a short socket.io 0.9 long-polling handshake.
+//! [`Overleaf::project_tree`] performs a short socket.io 0.9 long-polling handshake. Overleaf allows
+//! 45 such joins per user and project per minute, so the tree is cached for [`TREE_TTL`].
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -20,6 +22,18 @@ const CSRF_HEADER: &str = "X-Csrf-Token";
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(20);
 const COMPILE_ATTEMPTS: usize = 10;
 const COMPILE_RETRY_DELAY: Duration = Duration::from_millis(1500);
+/// How long a project file tree is reused. Entity ids stay the same when files are edited or renamed, and
+/// callers fetch the tree again when a path is missing or a read with a cached id fails.
+pub const TREE_TTL: Duration = Duration::from_secs(60);
+/// Waits after Overleaf refused a join as rate-limited; together longer than its one-minute window.
+const JOIN_RETRY_DELAYS: [Duration; 6] = [
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+    Duration::from_secs(30),
+    Duration::from_secs(30),
+];
 
 pub struct Overleaf {
     base: String,
@@ -30,7 +44,12 @@ pub struct Overleaf {
     csrf: Mutex<Option<String>>,
     /// Output files of the last compile per project, so that they can be fetched later.
     last_compile: Mutex<HashMap<String, Vec<OutputFile>>>,
+    /// File tree per project; the inner lock makes concurrent callers share one join.
+    trees: Mutex<HashMap<String, TreeSlot>>,
 }
+
+/// Cached file tree of one project; empty until fetched.
+type TreeSlot = Arc<Mutex<Option<Arc<ProjectTree>>>>;
 
 /// The project does not exist or was deleted; a fresh login would not help.
 #[derive(Debug)]
@@ -43,6 +62,22 @@ impl std::fmt::Display for ProjectNotFound {
 }
 
 impl std::error::Error for ProjectNotFound {}
+
+/// Overleaf refused to open the project because of too many joins in the last minute.
+#[derive(Debug)]
+pub struct RateLimited(String);
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Overleaf rate-limited opening the project, try again in a minute: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for RateLimited {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -67,6 +102,9 @@ pub struct Entity {
     pub path: String,
     pub kind: EntityKind,
     pub id: String,
+    /// Files only: SHA-1 of the content as `git hash-object` computes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -76,9 +114,9 @@ pub struct ProjectTree {
     pub root_doc: Option<String>,
     #[serde(skip)]
     pub root_folder_id: String,
-    #[serde(skip)]
-    pub root_doc_id: Option<String>,
     pub entities: Vec<Entity>,
+    #[serde(skip)]
+    pub fetched: Instant,
 }
 
 impl ProjectTree {
@@ -154,6 +192,7 @@ impl Overleaf {
             http,
             csrf: Mutex::new(None),
             last_compile: Mutex::new(HashMap::new()),
+            trees: Mutex::new(HashMap::new()),
         })
     }
 
@@ -318,16 +357,54 @@ impl Overleaf {
             .ok_or_else(|| anyhow!("create project: no project_id in {resp}"))
     }
 
-    /// Fetches the project file tree from the real-time service (socket.io 0.9, xhr-polling).
-    pub async fn project_tree(&self, project_id: &str) -> Result<ProjectTree> {
-        match self.join_project(project_id).await {
-            Ok(tree) => Ok(tree),
-            Err(e) if e.is::<ProjectNotFound>() => Err(e),
-            Err(e) => {
-                // most likely an expired session: the socket handshake does not redirect
-                tracing::info!(error = %e, "joinProject failed, retrying after a fresh login");
-                self.invalidate_session().await;
-                self.join_project(project_id).await
+    /// Returns the project file tree, reusing one fetched less than `max_age` ago or while this call waited
+    /// for another caller's fetch. `Duration::ZERO` asks for a tree fetched after the call started.
+    pub async fn project_tree(&self, project_id: &str, max_age: Duration) -> Result<Arc<ProjectTree>> {
+        let asked = Instant::now();
+        let slot = self
+            .trees
+            .lock()
+            .await
+            .entry(project_id.to_string())
+            .or_default()
+            .clone();
+        let mut cached = slot.lock().await;
+        if let Some(tree) = cached
+            .as_ref()
+            .filter(|t| t.fetched >= asked || t.fetched.elapsed() < max_age)
+        {
+            return Ok(tree.clone());
+        }
+        let tree = Arc::new(self.fetch_tree(project_id).await?);
+        *cached = Some(tree.clone());
+        Ok(tree)
+    }
+
+    /// Forgets the cached file tree after the project was changed through this server.
+    pub async fn invalidate_tree(&self, project_id: &str) {
+        self.trees.lock().await.remove(project_id);
+    }
+
+    /// Fetches the project file tree from the real-time service (socket.io 0.9, xhr-polling), waiting out
+    /// Overleaf's join rate limit.
+    async fn fetch_tree(&self, project_id: &str) -> Result<ProjectTree> {
+        let mut delays = JOIN_RETRY_DELAYS.iter();
+        loop {
+            let result = match self.join_project(project_id).await {
+                Err(e) if !e.is::<ProjectNotFound>() && !e.is::<RateLimited>() => {
+                    // most likely an expired session: the socket handshake does not redirect
+                    tracing::info!(error = %e, "joinProject failed, retrying after a fresh login");
+                    self.invalidate_session().await;
+                    self.join_project(project_id).await
+                }
+                result => result,
+            };
+            match (result, delays.next()) {
+                (Err(e), Some(delay)) if e.is::<RateLimited>() => {
+                    tracing::info!(project_id, ?delay, "joinProject rate-limited, waiting");
+                    tokio::time::sleep(*delay).await;
+                }
+                (result, _) => return result,
             }
         }
     }
@@ -396,8 +473,12 @@ impl Overleaf {
                                 return Ok((args["project"].clone(), permissions));
                             }
                             Some("connectionRejected") => {
-                                if event["args"][0]["code"] == json!("ProjectNotFound") {
-                                    return Err(ProjectNotFound.into());
+                                match event["args"][0]["code"].as_str() {
+                                    Some("ProjectNotFound") => return Err(ProjectNotFound.into()),
+                                    Some("TooManyRequests") => {
+                                        return Err(RateLimited(event["args"][0].to_string()).into());
+                                    }
+                                    _ => {}
                                 }
                                 bail!("access to the project was rejected: {}", event["args"][0])
                             }
@@ -431,6 +512,15 @@ impl Overleaf {
         Ok(resp.bytes().await?.to_vec())
     }
 
+    pub async fn download_zip(&self, project_id: &str) -> Result<Vec<u8>> {
+        let resp = self
+            .send_ok("download project", |c, _| {
+                c.get(self.url(&format!("/Project/{project_id}/download/zip")))
+            })
+            .await?;
+        Ok(resp.bytes().await?.to_vec())
+    }
+
     /// Creates or replaces the file at `path`, creating missing folders.
     pub async fn write_file(
         &self,
@@ -459,6 +549,7 @@ impl Overleaf {
             .await?;
         let status = resp.status();
         let body: Value = resp.json().await.unwrap_or(Value::Null);
+        self.invalidate_tree(project_id).await;
         if !status.is_success() || body["success"] != json!(true) {
             bail!("upload {path}: HTTP {status}: {body}");
         }
@@ -468,20 +559,25 @@ impl Overleaf {
     pub async fn delete_entity(&self, project_id: &str, entity: &Entity) -> Result<()> {
         let route = entity.kind.route();
         let id = &entity.id;
-        self.send_ok("delete", |c, _| {
-            c.delete(self.url(&format!("/project/{project_id}/{route}/{id}")))
-        })
-        .await?;
-        Ok(())
+        let result = self
+            .send_ok("delete", |c, _| {
+                c.delete(self.url(&format!("/project/{project_id}/{route}/{id}")))
+            })
+            .await;
+        // also when it failed: the id may have been out of date
+        self.invalidate_tree(project_id).await;
+        result.map(drop)
     }
 
     pub async fn set_root_doc(&self, project_id: &str, doc_id: &str) -> Result<()> {
         let body = json!({ "rootDocId": doc_id });
-        self.send_ok("set main document", |c, _| {
-            c.post(self.url(&format!("/project/{project_id}/settings"))).json(&body)
-        })
-        .await?;
-        Ok(())
+        let result = self
+            .send_ok("set main document", |c, _| {
+                c.post(self.url(&format!("/project/{project_id}/settings"))).json(&body)
+            })
+            .await;
+        self.invalidate_tree(project_id).await;
+        result.map(drop)
     }
 
     pub async fn compile(
@@ -681,8 +777,8 @@ fn parse_tree(project: &Value, permissions: String) -> Result<ProjectTree> {
         permissions,
         root_doc,
         root_folder_id,
-        root_doc_id,
         entities,
+        fetched: Instant::now(),
     })
 }
 
@@ -705,6 +801,7 @@ fn walk_folder(folder: &Value, prefix: &str, out: &mut Vec<Entity>) {
                 path,
                 kind,
                 id: id.to_string(),
+                hash: child["hash"].as_str().map(str::to_string),
             });
         }
     }
@@ -795,7 +892,7 @@ mod tests {
             "rootFolder": [{
                 "_id": "root",
                 "docs": [{ "_id": "d1", "name": "main.tex" }],
-                "fileRefs": [{ "_id": "f1", "name": "logo.png" }],
+                "fileRefs": [{ "_id": "f1", "name": "logo.png", "hash": "abc" }],
                 "folders": [{ "_id": "s", "name": "sec", "docs": [{ "_id": "d2", "name": "a.tex" }], "fileRefs": [], "folders": [] }],
             }],
         });
@@ -804,6 +901,8 @@ mod tests {
         assert_eq!(tree.root_doc.as_deref(), Some("main.tex"));
         assert_eq!(tree.find("/sec/a.tex").unwrap().id, "d2");
         assert_eq!(tree.find("sec").unwrap().kind, EntityKind::Folder);
+        assert_eq!(tree.find("logo.png").unwrap().hash.as_deref(), Some("abc"));
+        assert_eq!(tree.find("main.tex").unwrap().hash, None);
     }
 
     #[test]

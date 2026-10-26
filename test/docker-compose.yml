@@ -27,7 +27,7 @@ services:
     image: redis:7.4.11
     container_name: olmcp-redis
   mcp:
-    image: overleaf-mcp:0.1.0
+    image: overleaf-mcp:0.2.0
     container_name: olmcp-mcp
     depends_on: [sharelatex]
     restart: unless-stopped

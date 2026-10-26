@@ -1,6 +1,7 @@
 //! MCP tool definitions, built with the `rmcp` tool macros.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use base64::Engine;
@@ -12,7 +13,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::lines::LineFilter;
-use crate::overleaf::{EntityKind, Overleaf, normalize_path};
+use crate::overleaf::{Entity, EntityKind, Overleaf, TREE_TTL, normalize_path};
 
 const INSTRUCTIONS: &str = "Tools for an Overleaf (ShareLaTeX) server. Projects are identified by the id from \
 list_projects or create_project, files by their path inside the project (e.g. main.tex, chapters/intro.tex). \
@@ -164,6 +165,12 @@ fn image_mime(path: &str) -> Option<&'static str> {
     }
 }
 
+/// Content of a project file as Overleaf stores it.
+enum FileContent {
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
 fn blob(uri: String, mime: &str, bytes: &[u8]) -> ContentBlock {
     ContentBlock::resource(ResourceContents::BlobResourceContents {
         uri,
@@ -181,44 +188,74 @@ impl OverleafMcp {
         }
     }
 
-    async fn read_text(&self, project_id: &str, path: &str) -> Result<String> {
-        let tree = self.overleaf.project_tree(project_id).await?;
-        let entity = tree
-            .find(path)
-            .ok_or_else(|| anyhow!("no file {path:?} in the project"))?;
+    /// Looks `path` up in the cached file tree, fetching the tree again when the path is not in it.
+    async fn entity(&self, project_id: &str, path: &str) -> Result<Entity> {
+        let started = Instant::now();
+        let tree = self.overleaf.project_tree(project_id, TREE_TTL).await?;
+        if let Some(entity) = tree.find(path) {
+            return Ok(entity.clone());
+        }
+        let tree = if tree.fetched >= started {
+            tree
+        } else {
+            self.overleaf.project_tree(project_id, Duration::ZERO).await?
+        };
+        tree.find(path)
+            .cloned()
+            .ok_or_else(|| anyhow!("no file {path:?} in the project"))
+    }
+
+    async fn read_entity(&self, project_id: &str, entity: &Entity) -> Result<FileContent> {
         match entity.kind {
-            EntityKind::Doc => self.overleaf.read_doc(project_id, &entity.id).await,
-            EntityKind::File => {
-                let bytes = self.overleaf.read_file(project_id, &entity.id).await?;
-                String::from_utf8(bytes).map_err(|_| anyhow!("{path} is a binary file"))
+            EntityKind::Doc => Ok(FileContent::Text(self.overleaf.read_doc(project_id, &entity.id).await?)),
+            EntityKind::File => Ok(FileContent::Bytes(
+                self.overleaf.read_file(project_id, &entity.id).await?,
+            )),
+            EntityKind::Folder => bail!("{} is a folder; use list_files", entity.path),
+        }
+    }
+
+    /// Reads the file at `path`. The cached tree may be out of date when someone else replaced or deleted the
+    /// file, so a failed read is tried once more with a fresh tree.
+    async fn read(&self, project_id: &str, path: &str) -> Result<(Entity, FileContent)> {
+        let entity = self.entity(project_id, path).await?;
+        let error = match self.read_entity(project_id, &entity).await {
+            Ok(content) => return Ok((entity, content)),
+            Err(e) if entity.kind == EntityKind::Folder => return Err(e),
+            Err(e) => e,
+        };
+        let tree = self.overleaf.project_tree(project_id, Duration::ZERO).await?;
+        match tree.find(path) {
+            Some(fresh) if fresh.id != entity.id => {
+                let content = self.read_entity(project_id, fresh).await?;
+                Ok((fresh.clone(), content))
             }
-            EntityKind::Folder => bail!("{path} is a folder"),
+            Some(_) => Err(error),
+            None => bail!("no file {path:?} in the project"),
+        }
+    }
+
+    async fn read_text(&self, project_id: &str, path: &str) -> Result<String> {
+        match self.read(project_id, path).await? {
+            (_, FileContent::Text(text)) => Ok(text),
+            (_, FileContent::Bytes(bytes)) => String::from_utf8(bytes).map_err(|_| anyhow!("{path} is a binary file")),
         }
     }
 
     async fn do_read_file(&self, a: PathArgs) -> Result<Vec<ContentBlock>> {
         check_project_id(&a.project_id)?;
-        let tree = self.overleaf.project_tree(&a.project_id).await?;
-        let entity = tree
-            .find(&a.path)
-            .ok_or_else(|| anyhow!("no file {:?} in the project", a.path))?;
-        match entity.kind {
-            EntityKind::Doc => Ok(vec![ContentBlock::text(
-                self.overleaf.read_doc(&a.project_id, &entity.id).await?,
-            )]),
-            EntityKind::Folder => bail!("{} is a folder; use list_files", a.path),
-            EntityKind::File => {
-                let bytes = self.overleaf.read_file(&a.project_id, &entity.id).await?;
-                if let Some(mime) = image_mime(&entity.path) {
-                    return Ok(vec![ContentBlock::image(BASE64.encode(&bytes), mime)]);
-                }
-                match String::from_utf8(bytes) {
-                    Ok(text) => Ok(vec![ContentBlock::text(text)]),
-                    Err(e) => {
-                        let uri = format!("overleaf://{}/{}", a.project_id, entity.path);
-                        Ok(vec![blob(uri, "application/octet-stream", e.as_bytes())])
-                    }
-                }
+        let (entity, bytes) = match self.read(&a.project_id, &a.path).await? {
+            (_, FileContent::Text(text)) => return Ok(vec![ContentBlock::text(text)]),
+            (entity, FileContent::Bytes(bytes)) => (entity, bytes),
+        };
+        if let Some(mime) = image_mime(&entity.path) {
+            return Ok(vec![ContentBlock::image(BASE64.encode(&bytes), mime)]);
+        }
+        match String::from_utf8(bytes) {
+            Ok(text) => Ok(vec![ContentBlock::text(text)]),
+            Err(e) => {
+                let uri = format!("overleaf://{}/{}", a.project_id, entity.path);
+                Ok(vec![blob(uri, "application/octet-stream", e.as_bytes())])
             }
         }
     }
@@ -232,7 +269,7 @@ impl OverleafMcp {
         } else {
             a.content.into_bytes()
         };
-        let tree = self.overleaf.project_tree(&a.project_id).await?;
+        let tree = self.overleaf.project_tree(&a.project_id, TREE_TTL).await?;
         let written = self
             .overleaf
             .write_file(&a.project_id, &tree.root_folder_id, &a.path, content)
@@ -262,7 +299,7 @@ impl OverleafMcp {
         } else {
             text.replacen(&a.old_string, &a.new_string, 1)
         };
-        let tree = self.overleaf.project_tree(&a.project_id).await?;
+        let tree = self.overleaf.project_tree(&a.project_id, TREE_TTL).await?;
         self.overleaf
             .write_file(&a.project_id, &tree.root_folder_id, &a.path, updated.into_bytes())
             .await?;
@@ -271,20 +308,14 @@ impl OverleafMcp {
 
     async fn do_delete_file(&self, a: PathArgs) -> Result<Vec<ContentBlock>> {
         check_project_id(&a.project_id)?;
-        let tree = self.overleaf.project_tree(&a.project_id).await?;
-        let entity = tree
-            .find(&a.path)
-            .ok_or_else(|| anyhow!("no file {:?} in the project", a.path))?;
-        self.overleaf.delete_entity(&a.project_id, entity).await?;
+        let entity = self.entity(&a.project_id, &a.path).await?;
+        self.overleaf.delete_entity(&a.project_id, &entity).await?;
         json_block(json!({ "deleted": entity.path, "type": entity.kind }))
     }
 
     async fn do_set_main_file(&self, a: PathArgs) -> Result<Vec<ContentBlock>> {
         check_project_id(&a.project_id)?;
-        let tree = self.overleaf.project_tree(&a.project_id).await?;
-        let entity = tree
-            .find(&a.path)
-            .ok_or_else(|| anyhow!("no file {:?} in the project", a.path))?;
+        let entity = self.entity(&a.project_id, &a.path).await?;
         if entity.kind != EntityKind::Doc {
             bail!("{} is not an editable document", a.path);
         }
@@ -294,18 +325,16 @@ impl OverleafMcp {
 
     async fn do_compile(&self, a: CompileArgs) -> Result<Vec<ContentBlock>> {
         check_project_id(&a.project_id)?;
-        let tree = self.overleaf.project_tree(&a.project_id).await?;
+        // without a main file Overleaf compiles the project's main document
         let root_doc_id = match a.main_file.as_deref() {
             Some(path) => {
-                let entity = tree
-                    .find(path)
-                    .ok_or_else(|| anyhow!("no file {path:?} in the project"))?;
+                let entity = self.entity(&a.project_id, path).await?;
                 if entity.kind != EntityKind::Doc {
                     bail!("{path} is not a .tex document");
                 }
-                Some(entity.id.clone())
+                Some(entity.id)
             }
-            None => tree.root_doc_id.clone(),
+            None => None,
         };
         let result = self
             .overleaf
@@ -371,13 +400,30 @@ impl OverleafMcp {
     }
 
     #[tool(
-        description = "List all files and folders of a project with their type (doc = editable text, file = binary/uploaded) and the main document.",
+        description = "List all files and folders of a project with their type (doc = editable text, file = binary/uploaded) and the main document. Files carry a hash, the SHA-1 that `git hash-object` gives for their content, so unchanged files need not be read again.",
         annotations(read_only_hint = true)
     )]
     async fn list_files(&self, Parameters(a): Parameters<ProjectArgs>) -> CallToolResult {
         let result = async {
             check_project_id(&a.project_id)?;
-            json_block(self.overleaf.project_tree(&a.project_id).await?)
+            json_block(self.overleaf.project_tree(&a.project_id, Duration::ZERO).await?)
+        };
+        to_result(result.await)
+    }
+
+    #[tool(
+        description = "Download a whole project as a zip archive (all files in their folders). Use it to copy a project instead of reading the files one by one.",
+        annotations(read_only_hint = true)
+    )]
+    async fn download_project(&self, Parameters(a): Parameters<ProjectArgs>) -> CallToolResult {
+        let result = async {
+            check_project_id(&a.project_id)?;
+            let zip = self.overleaf.download_zip(&a.project_id).await?;
+            let uri = format!("overleaf://{}/project.zip", a.project_id);
+            Ok(vec![
+                ContentBlock::text(format!("project.zip: {} bytes", zip.len())),
+                blob(uri, "application/zip", &zip),
+            ])
         };
         to_result(result.await)
     }
